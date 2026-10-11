@@ -4313,6 +4313,39 @@ impl Connection {
                 };
                 let _guard = span.enter();
 
+                // Retry is not protected by packet AEAD. Check its integrity and whether
+                // it is still admissible before it can migrate the handshake path or
+                // affect authenticated-packet accounting and timers.
+                if matches!(packet.header, Header::Retry { .. }) && self.side.is_client() {
+                    let is_valid_retry = self
+                        .remote_cids
+                        .get(&path_id)
+                        .map(|cids| cids.active())
+                        .map(|orig_dst_cid| {
+                            self.crypto_state.session.is_valid_retry(
+                                orig_dst_cid,
+                                &packet.header_data,
+                                &packet.payload,
+                            )
+                        })
+                        .unwrap_or_default();
+                    if self.total_authed_packets > 0
+                    || packet.payload.len() <= 16 // token + 16 byte tag
+                    || !is_valid_retry
+                    {
+                        trace!("discarding invalid Retry");
+                        // - After the client has received and processed an Initial or Retry packet
+                        //   from the server, it MUST discard any subsequent Retry packets that it
+                        //   receives.
+                        // - A client MUST discard a Retry packet with a zero-length Retry Token
+                        //   field.
+                        // - Clients MUST discard Retry packets that have a Retry Integrity Tag that
+                        //   cannot be validated
+                        self.qlog.emit_packet_received(qlog, now);
+                        return;
+                    }
+                }
+
                 // Now the packet is authenticated we do the migration during the handshake,
                 // see Handshake::allow_server_migration for details.  Be careful here to
                 // not yet rely on the path existing however, new paths are accepted and
@@ -4570,31 +4603,6 @@ impl Connection {
                 debug_assert_eq!(path_id, PathId::ZERO);
                 if self.side.is_server() {
                     return Err(TransportError::PROTOCOL_VIOLATION("client sent Retry").into());
-                }
-
-                let is_valid_retry = self
-                    .remote_cids
-                    .get(&path_id)
-                    .map(|cids| cids.active())
-                    .map(|orig_dst_cid| {
-                        self.crypto_state.session.is_valid_retry(
-                            orig_dst_cid,
-                            &packet.header_data,
-                            &packet.payload,
-                        )
-                    })
-                    .unwrap_or_default();
-                if self.total_authed_packets > 1
-                    || packet.payload.len() <= 16 // token + 16 byte tag
-                    || !is_valid_retry
-                {
-                    trace!("discarding invalid Retry");
-                    // - After the client has received and processed an Initial or Retry packet from
-                    //   the server, it MUST discard any subsequent Retry packets that it receives.
-                    // - A client MUST discard a Retry packet with a zero-length Retry Token field.
-                    // - Clients MUST discard Retry packets that have a Retry Integrity Tag that
-                    //   cannot be validated
-                    return Ok(());
                 }
 
                 trace!("retrying with CID {}", remote_cid);
