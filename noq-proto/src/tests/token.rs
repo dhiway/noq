@@ -343,3 +343,248 @@ impl TimeSource for FakeTimeSource {
         *self.0.lock().unwrap()
     }
 }
+
+#[test]
+fn discarded_retry_on_another_path_does_not_migrate() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    pair.server.handle_incoming = Box::new(validate_incoming);
+    let mut config = client_config();
+    let mut transport = crate::TransportConfig::default();
+    transport.server_handshake_migration(true);
+    #[cfg(feature = "qlog")]
+    let capture = QlogCapture::default();
+    #[cfg(feature = "qlog")]
+    transport.qlog_factory(Arc::new(capture.clone()));
+    config.transport = Arc::new(transport);
+    let client = pair.begin_connect(config);
+    pair.drive_client();
+
+    // Fan the same first Initial over two paths, as Iroh's mixed address does.
+    let (when, initial) = pair.server.inbound.pop_first().unwrap();
+    let mut other_initial = initial.clone();
+    let other_server = "[fd15:70a:510b:1::2]:12345"
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+    other_initial.remote = "[fd15:70a:510b:1::1]:12345".parse().unwrap();
+    other_initial.dst_ip = Some(other_server.ip());
+    pair.server.inbound.push(when, initial);
+    pair.server.inbound.push(when, other_initial);
+    pair.server.drive(pair.time);
+    let (_, first_bytes) = pair.server.outbound.pop_front().unwrap();
+    let (_, second_bytes) = pair.server.outbound.pop_front().unwrap();
+    assert!(pair.server.outbound.is_empty());
+
+    let first = super::util::Inbound {
+        ecn: None,
+        packet: first_bytes.into(),
+        remote: Pair::SERVER_ADDR,
+        dst_ip: Some(Pair::CLIENT_ADDR.ip()),
+    };
+    let second = super::util::Inbound {
+        ecn: None,
+        packet: second_bytes.into(),
+        remote: other_server,
+        dst_ip: Some("fd15:70a:510b:1::1".parse().unwrap()),
+    };
+    pair.client.inbound.push(pair.time, first);
+    pair.client.drive_incoming(pair.time);
+    for event in pair.client.conn_events.remove(&client).unwrap() {
+        pair.client_conn_mut(client).handle_event(event);
+    }
+    let chosen = pair
+        .client_conn_mut(client)
+        .network_path(crate::PathId::ZERO)
+        .unwrap();
+    assert_eq!(chosen.remote(), Pair::SERVER_ADDR);
+
+    let next_timeout = pair.client_conn_mut(client).poll_timeout();
+    assert!(next_timeout.is_some());
+    #[cfg(feature = "qlog")]
+    let qlog_start = capture.checkpoint();
+
+    // Deliver the competing Retry before polling another transmit.
+    pair.time += Duration::from_millis(1);
+    pair.client.inbound.push(pair.time, second);
+    pair.client.drive_incoming(pair.time);
+    for event in pair.client.conn_events.remove(&client).unwrap() {
+        pair.client_conn_mut(client).handle_event(event);
+    }
+    assert_eq!(
+        pair.client_conn_mut(client)
+            .network_path(crate::PathId::ZERO)
+            .unwrap(),
+        chosen,
+        "a discarded Retry must not change the path selected by the accepted Retry"
+    );
+
+    assert_eq!(pair.client_conn_mut(client).poll_timeout(), next_timeout);
+    #[cfg(feature = "qlog")]
+    capture.assert_only_received_since(qlog_start);
+
+    // The original address-bound token and CID must still complete the handshake.
+    pair.drive();
+    let server = pair.server.assert_accept();
+    pair.finish_connect(client, server);
+}
+
+#[test]
+fn bad_tag_retry_does_not_migrate_or_block_valid_retry() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    pair.server.handle_incoming = Box::new(validate_incoming);
+    let mut config = client_config();
+    let mut transport = crate::TransportConfig::default();
+    transport.server_handshake_migration(true);
+    #[cfg(feature = "qlog")]
+    let capture = QlogCapture::default();
+    #[cfg(feature = "qlog")]
+    transport.qlog_factory(Arc::new(capture.clone()));
+    config.transport = Arc::new(transport);
+    let client = pair.begin_connect(config);
+    let original = pair
+        .client_conn_mut(client)
+        .network_path(crate::PathId::ZERO)
+        .unwrap();
+    pair.drive_client();
+    pair.drive_server();
+    let (_, valid_retry) = pair.client.inbound.pop_first().unwrap();
+    let mut invalid = valid_retry.clone();
+    invalid.remote = "[fd15:70a:510b:1::2]:12345".parse().unwrap();
+    let last = invalid.packet.len() - 1;
+    invalid.packet[last] ^= 1; // Corrupt the Retry integrity tag.
+    let next_timeout = pair.client_conn_mut(client).poll_timeout();
+    assert!(next_timeout.is_some());
+    #[cfg(feature = "qlog")]
+    let qlog_start = capture.checkpoint();
+    pair.time += Duration::from_millis(1);
+    pair.client.inbound.push(pair.time, invalid);
+    pair.client.drive_incoming(pair.time);
+    for event in pair.client.conn_events.remove(&client).unwrap() {
+        pair.client_conn_mut(client).handle_event(event);
+    }
+    assert_eq!(
+        pair.client_conn_mut(client)
+            .network_path(crate::PathId::ZERO)
+            .unwrap(),
+        original,
+        "a Retry with a bad integrity tag must not migrate the handshake"
+    );
+    assert_eq!(pair.client_conn_mut(client).poll_timeout(), next_timeout);
+    #[cfg(feature = "qlog")]
+    capture.assert_only_received_since(qlog_start);
+
+    pair.client.inbound.push(pair.time, valid_retry);
+    pair.drive();
+    let server = pair.server.assert_accept();
+    pair.finish_connect(client, server);
+}
+
+#[test]
+fn valid_first_retry_can_migrate_and_complete_handshake() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    pair.server.handle_incoming = Box::new(validate_incoming);
+    let mut config = client_config();
+    let mut transport = crate::TransportConfig::default();
+    transport.server_handshake_migration(true);
+    #[cfg(feature = "qlog")]
+    let capture = QlogCapture::default();
+    #[cfg(feature = "qlog")]
+    transport.qlog_factory(Arc::new(capture.clone()));
+    config.transport = Arc::new(transport);
+    let client = pair.begin_connect(config);
+    let original = pair
+        .client_conn_mut(client)
+        .network_path(crate::PathId::ZERO)
+        .unwrap();
+    pair.drive_client();
+
+    // The same Initial reaches the server on a different path. Its first response
+    // is a genuine address-bound Retry, and subsequent traffic uses that path.
+    let migrated_server = "[fd15:70a:510b:1::2]:12345"
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+    let (when, mut initial) = pair.server.inbound.pop_first().unwrap();
+    initial.dst_ip = Some(migrated_server.ip());
+    pair.server.inbound.push(when, initial);
+    pair.routes.as_basic_mut().server_addr = migrated_server;
+    pair.drive_server();
+    #[cfg(feature = "qlog")]
+    let qlog_start = capture.checkpoint();
+    pair.client.drive_incoming(pair.time);
+    for event in pair.client.conn_events.remove(&client).unwrap() {
+        pair.client_conn_mut(client).handle_event(event);
+    }
+    let chosen = pair
+        .client_conn_mut(client)
+        .network_path(crate::PathId::ZERO)
+        .unwrap();
+    assert_ne!(chosen, original);
+    assert_eq!(chosen.remote(), migrated_server);
+    #[cfg(feature = "qlog")]
+    {
+        assert_eq!(capture.events_since(qlog_start, "quic:packet_received"), 1);
+        assert_eq!(capture.events_since(qlog_start, "quic:tuple_assigned"), 1);
+    }
+
+    // Migration must preserve the valid first Retry's token/CID processing.
+    pair.drive();
+    let server = pair.server.assert_accept();
+    pair.finish_connect(client, server);
+}
+
+#[cfg(feature = "qlog")]
+#[derive(Clone, Default)]
+struct QlogCapture(Arc<Mutex<Vec<u8>>>);
+
+#[cfg(feature = "qlog")]
+impl QlogCapture {
+    fn checkpoint(&self) -> usize {
+        let len = self.0.lock().unwrap().len();
+        assert!(len > 0, "the connection must have an active qlog sink");
+        len
+    }
+
+    fn events_since(&self, start: usize, name: &str) -> usize {
+        let bytes = self.0.lock().unwrap();
+        // Count semantic event names in the complete JSON-SEQ records written by
+        // the real qlog streamer, without requiring another parsing dependency.
+        std::str::from_utf8(&bytes[start..])
+            .unwrap()
+            .split('\u{1e}')
+            .filter(|record| record.contains(name))
+            .count()
+    }
+
+    fn assert_only_received_since(&self, start: usize) {
+        assert_eq!(self.events_since(start, "quic:packet_received"), 1);
+        assert_eq!(self.events_since(start, "quic:tuple_assigned"), 0);
+        assert_eq!(self.events_since(start, "quic:timer_updated"), 0);
+    }
+}
+
+#[cfg(feature = "qlog")]
+impl std::io::Write for QlogCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "qlog")]
+impl crate::QlogFactory for QlogCapture {
+    fn for_connection(
+        &self,
+        _side: crate::Side,
+        _remote: std::net::SocketAddr,
+        _initial_dst_cid: crate::ConnectionId,
+        _now: crate::Instant,
+    ) -> Option<crate::QlogConfig> {
+        Some(crate::QlogConfig::new(Box::new(self.clone())))
+    }
+}
