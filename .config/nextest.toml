@@ -25,5 +25,5 @@ default-filter = 'all()'
 
 [[profile.ci.overrides]]
 filter = 'test(congestion::bbr3)'
-platform = 'cfg(target_env = "musl")'
+platform = 'cfg(any(target_env = "musl", windows))'
 slow-timeout = { period = "5s", terminate-after = 5 }
