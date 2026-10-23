@@ -1,6 +1,9 @@
 //! Tests specifically for tokens
 
-use std::sync::{Arc, Mutex};
+#[cfg(feature = "qlog")]
+use alloc::vec::Vec;
+use alloc::{boxed::Box, sync::Arc};
+use std::sync::Mutex;
 
 use assert_matches::assert_matches;
 
@@ -364,7 +367,7 @@ fn discarded_retry_on_another_path_does_not_migrate() {
     let (when, initial) = pair.server.inbound.pop_first().unwrap();
     let mut other_initial = initial.clone();
     let other_server = "[fd15:70a:510b:1::2]:12345"
-        .parse::<std::net::SocketAddr>()
+        .parse::<core::net::SocketAddr>()
         .unwrap();
     other_initial.remote = "[fd15:70a:510b:1::1]:12345".parse().unwrap();
     other_initial.dst_ip = Some(other_server.ip());
@@ -503,7 +506,7 @@ fn valid_first_retry_can_migrate_and_complete_handshake() {
     // The same Initial reaches the server on a different path. Its first response
     // is a genuine address-bound Retry, and subsequent traffic uses that path.
     let migrated_server = "[fd15:70a:510b:1::2]:12345"
-        .parse::<std::net::SocketAddr>()
+        .parse::<core::net::SocketAddr>()
         .unwrap();
     let (when, mut initial) = pair.server.inbound.pop_first().unwrap();
     initial.dst_ip = Some(migrated_server.ip());
@@ -550,7 +553,7 @@ impl QlogCapture {
         let bytes = self.0.lock().unwrap();
         // Count semantic event names in the complete JSON-SEQ records written by
         // the real qlog streamer, without requiring another parsing dependency.
-        std::str::from_utf8(&bytes[start..])
+        core::str::from_utf8(&bytes[start..])
             .unwrap()
             .split('\u{1e}')
             .filter(|record| record.contains(name))
@@ -581,7 +584,7 @@ impl crate::QlogFactory for QlogCapture {
     fn for_connection(
         &self,
         _side: crate::Side,
-        _remote: std::net::SocketAddr,
+        _remote: core::net::SocketAddr,
         _initial_dst_cid: crate::ConnectionId,
         _now: crate::Instant,
     ) -> Option<crate::QlogConfig> {
