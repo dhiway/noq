@@ -22,9 +22,9 @@ use crate::{
 use super::connection::qlog::ToQlog;
 
 #[cfg(test)]
-use alloc::{vec, vec::Vec};
-#[cfg(test)]
 use crate::varint::varint_u64;
+#[cfg(test)]
+use alloc::{vec, vec::Vec};
 #[cfg(test)]
 use proptest::{collection, prelude::any, strategy::Strategy};
 #[cfg(test)]
