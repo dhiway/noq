@@ -249,10 +249,18 @@ fn version_negotiation_from_another_address_does_not_migrate() {
     pair.finish_connect(client, server);
 }
 
-#[test]
-fn version_negotiation_after_handshake_does_not_reset_idle_timers() {
-    let _guard = subscribe();
-    let mut pair = Pair::default();
+/// An established connection pair, with a copy of a real 1-RTT datagram each side received
+/// (for its addresses) and the CID each side currently receives on
+struct LiveCids {
+    client: ConnectionHandle,
+    server: ConnectionHandle,
+    to_client: util::Inbound,
+    to_server: util::Inbound,
+    client_cid: Vec<u8>,
+    server_cid: Vec<u8>,
+}
+
+fn connect_with_live_cids(pair: &mut Pair) -> LiveCids {
     let client = pair.begin_connect(client_config());
     pair.drive_client();
     let (when, initial) = pair.server.inbound.pop_first().unwrap();
@@ -266,20 +274,39 @@ fn version_negotiation_after_handshake_does_not_reset_idle_timers() {
     let server = pair.server.assert_accept();
     pair.finish_connect(client, server);
 
-    // Take the CIDs and addresses each side currently receives on from a real 1-RTT packet.
     pair.client_conn_mut(client).ping();
     pair.server_conn_mut(server).ping();
     pair.drive_client();
     let (when, to_server) = pair.server.inbound.pop_first().unwrap();
-    let mut to_server_vn = to_server.clone();
+    let to_server_copy = to_server.clone();
     pair.server.inbound.push(when, to_server);
     pair.drive_server();
     let (when, to_client) = pair.client.inbound.pop_first().unwrap();
-    let mut to_client_vn = to_client.clone();
+    let to_client_copy = to_client.clone();
     pair.client.inbound.push(when, to_client);
     pair.drive();
-    let client_cid = to_client_vn.packet[1..1 + client_cid_len].to_vec();
-    let server_cid = to_server_vn.packet[1..1 + server_cid_len].to_vec();
+    LiveCids {
+        client,
+        server,
+        client_cid: to_client_copy.packet[1..1 + client_cid_len].to_vec(),
+        server_cid: to_server_copy.packet[1..1 + server_cid_len].to_vec(),
+        to_client: to_client_copy,
+        to_server: to_server_copy,
+    }
+}
+
+#[test]
+fn version_negotiation_after_handshake_does_not_reset_idle_timers() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let LiveCids {
+        client,
+        server,
+        to_client: mut to_client_vn,
+        to_server: mut to_server_vn,
+        client_cid,
+        server_cid,
+    } = connect_with_live_cids(&mut pair);
 
     let client_idle = pair
         .client_conn_mut(client)
@@ -318,6 +345,88 @@ fn version_negotiation_after_handshake_does_not_reset_idle_timers() {
         server_idle,
         "Version Negotiation must not reset the server's idle timer"
     );
+}
+
+/// A Retry packet to the endpoint using `dst_cid`, as a client could forge one
+fn retry_to(dst_cid: &[u8], src_cid: &[u8]) -> BytesMut {
+    let mut packet = BytesMut::new();
+    packet.put_u8(0xf0);
+    packet.put_u32(1);
+    packet.put_u8(dst_cid.len() as u8);
+    packet.extend_from_slice(dst_cid);
+    packet.put_u8(src_cid.len() as u8);
+    packet.extend_from_slice(src_cid);
+    packet.extend_from_slice(b"token");
+    packet.extend_from_slice(&[0; 16]);
+    packet
+}
+
+#[test]
+fn retry_received_by_server_after_handshake_has_no_effect() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let LiveCids {
+        server,
+        mut to_server,
+        client_cid,
+        server_cid,
+        ..
+    } = connect_with_live_cids(&mut pair);
+    let server_idle = pair
+        .server_conn_mut(server)
+        .timer_pending(Timer::Conn(ConnTimer::Idle));
+    assert!(server_idle.is_some());
+
+    // RFC 9000 17.2.5: only a client processes Retry. Retry is unprotected, so anyone who
+    // knows a CID can send one; a server must ignore it.
+    pair.time += Duration::from_millis(10);
+    to_server.packet = retry_to(&server_cid, &client_cid);
+    pair.server.inbound.push(pair.time, to_server);
+    pair.server.drive_incoming(pair.time);
+    let events = pair.server.conn_events.remove(&server);
+    for event in events.expect("the packet must reach the connection") {
+        pair.server_conn_mut(server).handle_event(event);
+    }
+    assert_eq!(
+        pair.server_conn_mut(server)
+            .timer_pending(Timer::Conn(ConnTimer::Idle)),
+        server_idle,
+        "a Retry must not reset the server's idle timer"
+    );
+    assert!(!pair.server_conn_mut(server).is_closed());
+}
+
+#[test]
+fn retry_received_by_server_during_handshake_does_not_close() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let client = pair.begin_connect(client_config());
+    pair.drive_client();
+    let (_, initial) = pair.server.inbound.pop_first().unwrap();
+    let (_, client_cid, _) = long_header_cids(&initial.packet);
+    let mut forged = initial.clone();
+    pair.server.inbound.push(pair.time, initial);
+    pair.drive_server();
+    let server = pair.server.assert_accept();
+    let (_, server_initial) = pair.client.inbound.pop_first().unwrap();
+    let (_, server_cid, _) = long_header_cids(&server_initial.packet);
+    pair.client.inbound.push(pair.time, server_initial);
+
+    // A forged Retry to the handshaking server connection, before the client's next flight.
+    forged.packet = retry_to(&server_cid, &client_cid);
+    pair.server.inbound.push(pair.time, forged);
+    pair.server.drive_incoming(pair.time);
+    let events = pair.server.conn_events.remove(&server);
+    for event in events.expect("the packet must reach the connection") {
+        pair.server_conn_mut(server).handle_event(event);
+    }
+    assert!(
+        !pair.server_conn_mut(server).is_closed(),
+        "a forged Retry must not close a handshaking server connection"
+    );
+
+    pair.drive();
+    pair.finish_connect(client, server);
 }
 
 #[test]
