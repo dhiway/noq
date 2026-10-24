@@ -4372,6 +4372,34 @@ impl Connection {
                     }
                 }
 
+                // Version Negotiation is not protected at all. Check whether it is still
+                // admissible before it can migrate the handshake path or affect
+                // authenticated-packet accounting and timers.
+                if matches!(packet.header, Header::VersionNegotiate { .. }) {
+                    let versions = &packet.payload;
+                    let lists_our_version = versions
+                        .chunks_exact(4)
+                        .any(|v| u32::from_be_bytes([v[0], v[1], v[2], v[3]]) == self.version);
+                    if self.side.is_server()
+                        || self.total_authed_packets > 0
+                        || versions.is_empty()
+                        || versions.len() % 4 != 0
+                        || lists_our_version
+                    {
+                        trace!("discarding inadmissible Version Negotiation");
+                        // - Only a server sends Version Negotiation; a server ignores one.
+                        // - A client MUST discard any Version Negotiation packet if it has received
+                        //   and successfully processed any other packet, including an earlier
+                        //   Version Negotiation packet.
+                        // - A client MUST discard a Version Negotiation packet that lists the QUIC
+                        //   version selected by the client.
+                        // - A packet whose version list is empty or not a whole number of versions
+                        //   is malformed.
+                        self.qlog.emit_packet_received(qlog, now);
+                        return;
+                    }
+                }
+
                 // Now the packet is authenticated we do the migration during the handshake,
                 // see Handshake::allow_server_migration for details.  Be careful here to
                 // not yet rely on the path existing however, new paths are accepted and
@@ -4845,19 +4873,7 @@ impl Connection {
                 Ok(())
             }
             Header::VersionNegotiate { .. } => {
-                if self.total_authed_packets > 1 {
-                    return Ok(());
-                }
-                let supported = packet
-                    .payload
-                    .chunks(4)
-                    .any(|x| match <[u8; 4]>::try_from(x) {
-                        Ok(version) => self.version == u32::from_be_bytes(version),
-                        Err(_) => false,
-                    });
-                if supported {
-                    return Ok(());
-                }
+                // Admissibility was checked in handle_packet before any state changed.
                 debug!("remote doesn't support our version");
                 Err(ConnectionError::VersionMismatch)
             }
