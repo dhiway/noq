@@ -4342,7 +4342,14 @@ impl Connection {
                 // Retry is not protected by packet AEAD. Check its integrity and whether
                 // it is still admissible before it can migrate the handshake path or
                 // affect authenticated-packet accounting and timers.
-                if matches!(packet.header, Header::Retry { .. }) && self.side.is_client() {
+                if matches!(packet.header, Header::Retry { .. }) && self.side.is_server() {
+                    // Only a client processes Retry (RFC 9000 17.2.5). Anyone who knows a CID
+                    // can forge one, so it must not change any state, nor close the connection.
+                    trace!("discarding Retry received by a server");
+                    self.qlog.emit_packet_received(qlog, now);
+                    return;
+                }
+                if matches!(packet.header, Header::Retry { .. }) {
                     let is_valid_retry = self
                         .remote_cids
                         .get(&path_id)
@@ -4657,9 +4664,6 @@ impl Connection {
                 ..
             } => {
                 debug_assert_eq!(path_id, PathId::ZERO);
-                if self.side.is_server() {
-                    return Err(TransportError::PROTOCOL_VIOLATION("client sent Retry").into());
-                }
 
                 trace!("retrying with CID {}", remote_cid);
                 let client_hello = state.client_hello.take().unwrap();
@@ -4715,7 +4719,7 @@ impl Connection {
 
                 let token_len = packet.payload.len() - 16;
                 let ConnectionSide::Client { ref mut token, .. } = self.side else {
-                    unreachable!("we already short-circuited if we're server");
+                    unreachable!("a server discards Retry in handle_packet");
                 };
                 *token = packet.payload.freeze().split_to(token_len);
 
