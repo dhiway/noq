@@ -270,10 +270,10 @@ fn version_negotiation_after_handshake_does_not_reset_idle_timers() {
     pair.client_conn_mut(client).ping();
     pair.server_conn_mut(server).ping();
     pair.drive_client();
-    pair.drive_server();
     let (when, to_server) = pair.server.inbound.pop_first().unwrap();
     let mut to_server_vn = to_server.clone();
     pair.server.inbound.push(when, to_server);
+    pair.drive_server();
     let (when, to_client) = pair.client.inbound.pop_first().unwrap();
     let mut to_client_vn = to_client.clone();
     pair.client.inbound.push(when, to_client);
