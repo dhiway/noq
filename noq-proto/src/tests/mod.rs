@@ -121,11 +121,11 @@ fn version_negotiate_client() {
         .unwrap();
     let now = Instant::now();
     let mut buf = Vec::with_capacity(client.config().get_max_udp_payload_size() as usize);
-    client_ch
+    let initial = client_ch
         .poll_transmit(now, NonZeroUsize::MIN, &mut buf)
         .expect("the client's first Initial");
     // The server echoes the client's (empty) Source CID and its original Destination CID
-    let (orig_dst_cid, _, _) = long_header_cids(&buf);
+    let (orig_dst_cid, _, _) = long_header_cids(&buf[..initial.size]);
     buf.clear();
     let opt_event = client.handle(
         now,
