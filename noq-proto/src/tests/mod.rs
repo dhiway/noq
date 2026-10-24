@@ -234,6 +234,50 @@ fn version_negotiation_not_echoing_original_dst_cid_is_ignored() {
 }
 
 #[test]
+fn version_negotiation_after_retry_is_ignored() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    pair.server.handle_incoming = Box::new(validate_incoming);
+    let client = pair.begin_connect(client_config());
+    pair.drive_client();
+    let (when, initial) = pair.server.inbound.pop_first().unwrap();
+    // Well formed, echoing the client's CIDs and not listing its version: admissible but for
+    // arriving after the client processed the server's Retry. A Retry leaves the client
+    // handshaking, so only the RFC 9000 6.2 rule can discard it (after the server's Initial
+    // flight the client would already be established and drop it as a pre-handshake packet).
+    let vn_packet = version_negotiation_reply(&initial.packet, &[0x0a1a_2a3a]);
+    pair.server.inbound.push(when, initial);
+    pair.drive_server();
+    // Send it on the same path as the Retry.
+    let (when, retry) = pair.client.inbound.pop_first().unwrap();
+    let mut vn = retry.clone();
+    vn.packet = vn_packet;
+    pair.client.inbound.push(when, retry);
+    pair.client.drive_incoming(pair.time);
+    for event in pair.client.conn_events.remove(&client).unwrap() {
+        pair.client_conn_mut(client).handle_event(event);
+    }
+
+    // RFC 9000 6.2: a client MUST discard any Version Negotiation packet if it has received
+    // and successfully processed any other packet.
+    pair.client.inbound.push(pair.time, vn);
+    pair.client.drive_incoming(pair.time);
+    let events = pair.client.conn_events.remove(&client);
+    for event in events.expect("the packet must reach the connection") {
+        pair.client_conn_mut(client).handle_event(event);
+    }
+    assert_matches!(
+        pair.client_conn_mut(client).poll(),
+        None,
+        "a Version Negotiation packet after the server's Retry must not end the connection"
+    );
+
+    pair.drive();
+    let server = pair.server.assert_accept();
+    pair.finish_connect(client, server);
+}
+
+#[test]
 fn version_negotiation_listing_our_version_does_not_block_retry() {
     let _guard = subscribe();
     let mut pair = Pair::default();
