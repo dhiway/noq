@@ -4377,9 +4377,9 @@ impl Connection {
                 // authenticated-packet accounting and timers.
                 if matches!(packet.header, Header::VersionNegotiate { .. }) {
                     let versions = &packet.payload;
-                    let lists_our_version = versions
-                        .chunks_exact(4)
-                        .any(|v| u32::from_be_bytes([v[0], v[1], v[2], v[3]]) == self.version);
+                    let (whole, _) = versions.as_chunks::<4>();
+                    let lists_our_version =
+                        whole.iter().any(|v| u32::from_be_bytes(*v) == self.version);
                     if self.side.is_server()
                         || self.total_authed_packets > 0
                         || versions.is_empty()
