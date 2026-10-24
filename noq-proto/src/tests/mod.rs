@@ -11,7 +11,7 @@ use core::{
 use assert_matches::assert_matches;
 #[cfg(all(feature = "aws-lc-rs", not(feature = "ring")))]
 use aws_lc_rs::hmac;
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use hex_literal::hex;
 use rand::Rng;
 #[cfg(feature = "ring")]
@@ -36,6 +36,7 @@ use crate::{
     cid_generator::{ConnectionIdGenerator, RandomConnectionIdGenerator},
     coding::{Decodable, Encodable},
     congestion::{Controller, ControllerFactory, ControllerMetrics},
+    connection::timer::{ConnTimer, Timer},
     crypto::rustls::{QuicServerConfig, configured_provider},
     frame::{self, Frame, FrameStruct},
     packet::{FixedLengthConnectionIdParser, Header, InitialHeader, PacketNumber, PartialDecode},
@@ -49,7 +50,8 @@ pub(crate) use util::subscribe;
 use util::{
     CERTIFIED_KEY, ConnPair, DEFAULT_MTU, IncomingConnectionBehavior, Pair, client_config,
     client_config_with_certs, client_config_with_deterministic_pns, client_crypto_with_alpn,
-    server_config, server_config_with_cert, server_crypto_with_alpn, validate_incoming,
+    long_header_cids, server_config, server_config_with_cert, server_crypto_with_alpn,
+    validate_incoming,
 };
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -142,6 +144,178 @@ fn version_negotiate_client() {
         Some(Event::ConnectionLost {
             reason: ConnectionError::VersionMismatch,
         })
+    );
+}
+
+/// A Version Negotiation packet to the endpoint using `dst_cid`, listing `versions`
+fn version_negotiation(dst_cid: &[u8], src_cid: &[u8], versions: &[u32]) -> BytesMut {
+    let mut packet = BytesMut::new();
+    packet.put_u8(0x80 | 0x2a);
+    packet.put_u32(0);
+    packet.put_u8(dst_cid.len() as u8);
+    packet.extend_from_slice(dst_cid);
+    packet.put_u8(src_cid.len() as u8);
+    packet.extend_from_slice(src_cid);
+    for &version in versions {
+        packet.put_u32(version);
+    }
+    packet
+}
+
+/// A Version Negotiation packet a server could send in reply to a client's first Initial
+fn version_negotiation_reply(initial: &[u8], versions: &[u32]) -> BytesMut {
+    let (dst_cid, src_cid, _) = long_header_cids(initial);
+    version_negotiation(&src_cid, &dst_cid, versions)
+}
+
+#[test]
+fn version_negotiation_listing_our_version_does_not_block_retry() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    pair.server.handle_incoming = Box::new(validate_incoming);
+    let client = pair.begin_connect(client_config());
+    pair.drive_client();
+    let (when, initial) = pair.server.inbound.pop_first().unwrap();
+    let mut vn = initial.clone();
+    vn.packet = version_negotiation_reply(&initial.packet, &[0x0a1a_2a3a, 1]);
+    vn.remote = Pair::SERVER_ADDR;
+    vn.dst_ip = Some(Pair::CLIENT_ADDR.ip());
+    pair.server.inbound.push(when, initial);
+    let idle = pair
+        .client_conn_mut(client)
+        .timer_pending(Timer::Conn(ConnTimer::Idle));
+    assert!(idle.is_some());
+
+    // RFC 9000 6.2: a client MUST discard a Version Negotiation packet that lists the
+    // version it selected. Discarded, it must not count as a processed packet, or the
+    // server's genuine Retry that follows would be discarded too.
+    pair.time += Duration::from_millis(1);
+    pair.client.inbound.push(pair.time, vn);
+    pair.client.drive_incoming(pair.time);
+    if let Some(events) = pair.client.conn_events.remove(&client) {
+        for event in events {
+            pair.client_conn_mut(client).handle_event(event);
+        }
+    }
+    assert_eq!(
+        pair.client_conn_mut(client)
+            .timer_pending(Timer::Conn(ConnTimer::Idle)),
+        idle,
+        "a discarded Version Negotiation packet must not reset the idle timer"
+    );
+
+    pair.drive();
+    let server = pair.server.assert_accept();
+    pair.finish_connect(client, server);
+}
+
+#[test]
+fn version_negotiation_from_another_address_does_not_migrate() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let mut config = client_config();
+    let mut transport = TransportConfig::default();
+    transport.server_handshake_migration(true);
+    config.transport = Arc::new(transport);
+    let client = pair.begin_connect(config);
+    let original = pair
+        .client_conn_mut(client)
+        .network_path(PathId::ZERO)
+        .unwrap();
+    pair.drive_client();
+    let (when, initial) = pair.server.inbound.pop_first().unwrap();
+    let mut vn = initial.clone();
+    vn.packet = version_negotiation_reply(&initial.packet, &[0x0a1a_2a3a, 1]);
+    vn.remote = "[fd15:70a:510b:1::2]:12345".parse().unwrap();
+    vn.dst_ip = Some(Pair::CLIENT_ADDR.ip());
+    pair.server.inbound.push(when, initial);
+
+    pair.time += Duration::from_millis(1);
+    pair.client.inbound.push(pair.time, vn);
+    pair.client.drive_incoming(pair.time);
+    if let Some(events) = pair.client.conn_events.remove(&client) {
+        for event in events {
+            pair.client_conn_mut(client).handle_event(event);
+        }
+    }
+    assert_eq!(
+        pair.client_conn_mut(client)
+            .network_path(PathId::ZERO)
+            .unwrap(),
+        original,
+        "a discarded Version Negotiation packet must not migrate the handshake"
+    );
+
+    pair.drive();
+    let server = pair.server.assert_accept();
+    pair.finish_connect(client, server);
+}
+
+#[test]
+fn version_negotiation_after_handshake_does_not_reset_idle_timers() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let client = pair.begin_connect(client_config());
+    pair.drive_client();
+    let (when, initial) = pair.server.inbound.pop_first().unwrap();
+    let (_, client_cid, _) = long_header_cids(&initial.packet);
+    pair.server.inbound.push(when, initial);
+    pair.drive_server();
+    let (when, server_initial) = pair.client.inbound.pop_first().unwrap();
+    let (_, server_cid, _) = long_header_cids(&server_initial.packet);
+    pair.client.inbound.push(when, server_initial);
+    pair.drive();
+    let server = pair.server.assert_accept();
+    pair.finish_connect(client, server);
+
+    let client_idle = pair
+        .client_conn_mut(client)
+        .timer_pending(Timer::Conn(ConnTimer::Idle));
+    let server_idle = pair
+        .server_conn_mut(server)
+        .timer_pending(Timer::Conn(ConnTimer::Idle));
+    assert!(client_idle.is_some() && server_idle.is_some());
+
+    // Version Negotiation carries no protection at all, so anyone who knows a CID can
+    // send one. After the handshake it must have no effect on either side.
+    pair.time += Duration::from_millis(10);
+    let to_client = util::Inbound {
+        ecn: None,
+        packet: version_negotiation(&client_cid, &server_cid, &[0x0a1a_2a3a]),
+        remote: Pair::SERVER_ADDR,
+        dst_ip: Some(Pair::CLIENT_ADDR.ip()),
+    };
+    let to_server = util::Inbound {
+        ecn: None,
+        packet: version_negotiation(&server_cid, &client_cid, &[0x0a1a_2a3a]),
+        remote: Pair::CLIENT_ADDR,
+        dst_ip: Some(Pair::SERVER_ADDR.ip()),
+    };
+    pair.client.inbound.push(pair.time, to_client);
+    pair.client.drive_incoming(pair.time);
+    if let Some(events) = pair.client.conn_events.remove(&client) {
+        for event in events {
+            pair.client_conn_mut(client).handle_event(event);
+        }
+    }
+    pair.server.inbound.push(pair.time, to_server);
+    pair.server.drive_incoming(pair.time);
+    if let Some(events) = pair.server.conn_events.remove(&server) {
+        for event in events {
+            pair.server_conn_mut(server).handle_event(event);
+        }
+    }
+    assert_eq!(
+        pair.client_conn_mut(client)
+            .timer_pending(Timer::Conn(ConnTimer::Idle)),
+        client_idle,
+        "Version Negotiation after the handshake must not reset the client's idle timer"
+    );
+    assert_eq!(
+        pair.server_conn_mut(server)
+            .timer_pending(Timer::Conn(ConnTimer::Idle)),
+        server_idle,
+        "Version Negotiation must not reset the server's idle timer"
     );
 }
 

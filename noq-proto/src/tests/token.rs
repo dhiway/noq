@@ -13,10 +13,11 @@ use crate::{
 };
 
 use super::util::{
-    IncomingConnectionBehavior, Pair, client_config, server_config, subscribe, validate_incoming,
+    IncomingConnectionBehavior, Pair, client_config, long_header_cids, server_config, subscribe,
+    validate_incoming,
 };
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_bindgen_test::wasm_bindgen_test as test;
 
@@ -535,6 +536,131 @@ fn valid_first_retry_can_migrate_and_complete_handshake() {
     pair.drive();
     let server = pair.server.assert_accept();
     pair.finish_connect(client, server);
+}
+
+#[test]
+fn second_valid_retry_is_discarded_without_migrating() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    pair.server.handle_incoming = Box::new(validate_incoming);
+    let mut config = client_config();
+    let mut transport = crate::TransportConfig::default();
+    transport.server_handshake_migration(true);
+    config.transport = Arc::new(transport);
+    let client = pair.begin_connect(config);
+    pair.drive_client();
+    pair.drive_server();
+    let (when, first) = pair.client.inbound.pop_first().unwrap();
+    let mut second = first.clone();
+    pair.client.inbound.push(when, first);
+    pair.client.drive_incoming(pair.time);
+    for event in pair.client.conn_events.remove(&client).unwrap() {
+        pair.client_conn_mut(client).handle_event(event);
+    }
+    let chosen = pair
+        .client_conn_mut(client)
+        .network_path(crate::PathId::ZERO)
+        .unwrap();
+    let next_timeout = pair.client_conn_mut(client).poll_timeout();
+    assert!(next_timeout.is_some());
+
+    // A second Retry whose integrity tag is valid for the CID the client now uses, from
+    // another address: only the rule that a client accepts one Retry can discard it.
+    let (_, retry_src_cid, token_at) = long_header_cids(&second.packet);
+    let token = second.packet[token_at..second.packet.len() - 16].to_vec();
+    second.packet = forge_retry(&second.packet, &[0x42; 8], &token, retry_src_cid);
+    second.remote = "[fd15:70a:510b:1::2]:12345".parse().unwrap();
+    pair.time += Duration::from_millis(1);
+    pair.client.inbound.push(pair.time, second);
+    pair.client.drive_incoming(pair.time);
+    for event in pair.client.conn_events.remove(&client).unwrap() {
+        pair.client_conn_mut(client).handle_event(event);
+    }
+    assert_eq!(
+        pair.client_conn_mut(client)
+            .network_path(crate::PathId::ZERO)
+            .unwrap(),
+        chosen,
+        "a second Retry must not migrate the handshake"
+    );
+    assert_eq!(pair.client_conn_mut(client).poll_timeout(), next_timeout);
+
+    pair.drive();
+    let server = pair.server.assert_accept();
+    pair.finish_connect(client, server);
+}
+
+#[test]
+fn zero_length_token_retry_is_discarded_without_migrating() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    pair.server.handle_incoming = Box::new(validate_incoming);
+    let mut config = client_config();
+    let mut transport = crate::TransportConfig::default();
+    transport.server_handshake_migration(true);
+    config.transport = Arc::new(transport);
+    let client = pair.begin_connect(config);
+    let original = pair
+        .client_conn_mut(client)
+        .network_path(crate::PathId::ZERO)
+        .unwrap();
+    pair.drive_client();
+    let (when, initial) = pair.server.inbound.pop_first().unwrap();
+    let (orig_dst_cid, _, _) = long_header_cids(&initial.packet);
+    pair.server.inbound.push(when, initial);
+    pair.drive_server();
+    let (_, valid_retry) = pair.client.inbound.pop_first().unwrap();
+
+    // Same CIDs and a valid integrity tag, but no token.
+    let mut empty = valid_retry.clone();
+    let (_, retry_src_cid, _) = long_header_cids(&valid_retry.packet);
+    empty.packet = forge_retry(&valid_retry.packet, &retry_src_cid, &[], orig_dst_cid);
+    empty.remote = "[fd15:70a:510b:1::2]:12345".parse().unwrap();
+    let next_timeout = pair.client_conn_mut(client).poll_timeout();
+    assert!(next_timeout.is_some());
+    pair.time += Duration::from_millis(1);
+    pair.client.inbound.push(pair.time, empty);
+    pair.client.drive_incoming(pair.time);
+    for event in pair.client.conn_events.remove(&client).unwrap() {
+        pair.client_conn_mut(client).handle_event(event);
+    }
+    assert_eq!(
+        pair.client_conn_mut(client)
+            .network_path(crate::PathId::ZERO)
+            .unwrap(),
+        original,
+        "a Retry with a zero-length token must not migrate the handshake"
+    );
+    assert_eq!(pair.client_conn_mut(client).poll_timeout(), next_timeout);
+
+    pair.client.inbound.push(pair.time, valid_retry);
+    pair.drive();
+    let server = pair.server.assert_accept();
+    pair.finish_connect(client, server);
+}
+
+/// A Retry with `valid`'s first byte, version and destination CID, the given source CID
+/// and token, and an integrity tag that is valid for a client whose active remote CID is
+/// `orig_dst_cid`
+fn forge_retry(
+    valid: &[u8],
+    src_cid: &[u8],
+    token: &[u8],
+    orig_dst_cid: crate::ConnectionId,
+) -> BytesMut {
+    let (dst_cid, _, _) = long_header_cids(valid);
+    let version = u32::from_be_bytes(valid[1..5].try_into().unwrap());
+    let mut packet = BytesMut::from(&valid[..5]);
+    packet.put_u8(dst_cid.len() as u8);
+    packet.extend_from_slice(&dst_cid);
+    packet.put_u8(src_cid.len() as u8);
+    packet.extend_from_slice(src_cid);
+    packet.extend_from_slice(token);
+    let tag = server_config()
+        .crypto
+        .retry_tag(version, orig_dst_cid, &packet);
+    packet.extend_from_slice(&tag);
+    packet
 }
 
 #[cfg(feature = "qlog")]

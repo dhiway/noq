@@ -32,11 +32,11 @@ use crate::connection::timer::Timer;
 use crate::crypto::rustls::{QuicClientConfig, QuicServerConfig, configured_provider};
 use crate::{
     ClientConfig, ClosePathError, ClosedPath, Connection, ConnectionError, ConnectionEvent,
-    ConnectionHandle, ConnectionStats, DatagramEvent, Datagrams, Dir, Duration, EcnCodepoint,
-    Endpoint, EndpointConfig, EndpointEvent, Event, FourTuple, HashMap, HashSet, Incoming, Instant,
-    MultipathNotNegotiated, NetworkChangeHint, PathAbandonReason, PathError, PathId, PathStats,
-    PathStatus, RecvStream, SendStream, ServerConfig, SetPathStatusError, Side, StreamId, Streams,
-    SystemTime, TokenLog, TokenReuseError, Transmit, TransportConfig, VarInt,
+    ConnectionHandle, ConnectionId, ConnectionStats, DatagramEvent, Datagrams, Dir, Duration,
+    EcnCodepoint, Endpoint, EndpointConfig, EndpointEvent, Event, FourTuple, HashMap, HashSet,
+    Incoming, Instant, MultipathNotNegotiated, NetworkChangeHint, PathAbandonReason, PathError,
+    PathId, PathStats, PathStatus, RecvStream, SendStream, ServerConfig, SetPathStatusError, Side,
+    StreamId, Streams, SystemTime, TokenLog, TokenReuseError, Transmit, TransportConfig, VarInt,
     congestion::Controller, n0_nat_traversal,
 };
 
@@ -1289,6 +1289,18 @@ pub(super) enum IncomingConnectionBehavior {
     Reject,
     Retry,
     Wait,
+}
+
+/// The destination and source connection IDs of a long header packet at the start of
+/// `packet`, and the offset of the bytes that follow them
+pub(super) fn long_header_cids(packet: &[u8]) -> (ConnectionId, ConnectionId, usize) {
+    assert_ne!(packet[0] & 0x80, 0, "not a long header packet");
+    let dst_len = packet[5] as usize;
+    let dst_cid = ConnectionId::new(&packet[6..6 + dst_len]);
+    let src_at = 6 + dst_len;
+    let src_len = packet[src_at] as usize;
+    let src_cid = ConnectionId::new(&packet[src_at + 1..src_at + 1 + src_len]);
+    (dst_cid, src_cid, src_at + 1 + src_len)
 }
 
 pub(super) fn validate_incoming(incoming: &Incoming) -> IncomingConnectionBehavior {
