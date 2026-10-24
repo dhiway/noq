@@ -256,15 +256,30 @@ fn version_negotiation_after_handshake_does_not_reset_idle_timers() {
     let client = pair.begin_connect(client_config());
     pair.drive_client();
     let (when, initial) = pair.server.inbound.pop_first().unwrap();
-    let (_, client_cid, _) = long_header_cids(&initial.packet);
+    let client_cid_len = long_header_cids(&initial.packet).1.len();
     pair.server.inbound.push(when, initial);
     pair.drive_server();
     let (when, server_initial) = pair.client.inbound.pop_first().unwrap();
-    let (_, server_cid, _) = long_header_cids(&server_initial.packet);
+    let server_cid_len = long_header_cids(&server_initial.packet).1.len();
     pair.client.inbound.push(when, server_initial);
     pair.drive();
     let server = pair.server.assert_accept();
     pair.finish_connect(client, server);
+
+    // Take the CIDs and addresses each side currently receives on from a real 1-RTT packet.
+    pair.client_conn_mut(client).ping();
+    pair.server_conn_mut(server).ping();
+    pair.drive_client();
+    pair.drive_server();
+    let (when, to_server) = pair.server.inbound.pop_first().unwrap();
+    let mut to_server_vn = to_server.clone();
+    pair.server.inbound.push(when, to_server);
+    let (when, to_client) = pair.client.inbound.pop_first().unwrap();
+    let mut to_client_vn = to_client.clone();
+    pair.client.inbound.push(when, to_client);
+    pair.drive();
+    let client_cid = to_client_vn.packet[1..1 + client_cid_len].to_vec();
+    let server_cid = to_server_vn.packet[1..1 + server_cid_len].to_vec();
 
     let client_idle = pair
         .client_conn_mut(client)
@@ -277,25 +292,15 @@ fn version_negotiation_after_handshake_does_not_reset_idle_timers() {
     // Version Negotiation carries no protection at all, so anyone who knows a CID can
     // send one. After the handshake it must have no effect on either side.
     pair.time += Duration::from_millis(10);
-    let to_client = util::Inbound {
-        ecn: None,
-        packet: version_negotiation(&client_cid, &server_cid, &[0x0a1a_2a3a]),
-        remote: Pair::SERVER_ADDR,
-        dst_ip: Some(Pair::CLIENT_ADDR.ip()),
-    };
-    let to_server = util::Inbound {
-        ecn: None,
-        packet: version_negotiation(&server_cid, &client_cid, &[0x0a1a_2a3a]),
-        remote: Pair::CLIENT_ADDR,
-        dst_ip: Some(Pair::SERVER_ADDR.ip()),
-    };
-    pair.client.inbound.push(pair.time, to_client);
+    to_client_vn.packet = version_negotiation(&client_cid, &server_cid, &[0x0a1a_2a3a]);
+    to_server_vn.packet = version_negotiation(&server_cid, &client_cid, &[0x0a1a_2a3a]);
+    pair.client.inbound.push(pair.time, to_client_vn);
     pair.client.drive_incoming(pair.time);
     let events = pair.client.conn_events.remove(&client);
     for event in events.expect("the packet must reach the connection") {
         pair.client_conn_mut(client).handle_event(event);
     }
-    pair.server.inbound.push(pair.time, to_server);
+    pair.server.inbound.push(pair.time, to_server_vn);
     pair.server.drive_incoming(pair.time);
     let events = pair.server.conn_events.remove(&server);
     for event in events.expect("the packet must reach the connection") {
