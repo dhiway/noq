@@ -639,6 +639,56 @@ fn zero_length_token_retry_is_discarded_without_migrating() {
     pair.finish_connect(client, server);
 }
 
+#[test]
+fn retry_echoing_initial_dst_cid_as_src_cid_is_discarded() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    pair.server.handle_incoming = Box::new(validate_incoming);
+    let mut config = client_config();
+    let mut transport = crate::TransportConfig::default();
+    transport.server_handshake_migration(true);
+    config.transport = Arc::new(transport);
+    let client = pair.begin_connect(config);
+    let original = pair
+        .client_conn_mut(client)
+        .network_path(crate::PathId::ZERO)
+        .unwrap();
+    pair.drive_client();
+    let (when, initial) = pair.server.inbound.pop_first().unwrap();
+    let (orig_dst_cid, _, _) = long_header_cids(&initial.packet);
+    pair.server.inbound.push(when, initial);
+    pair.drive_server();
+    let (_, valid_retry) = pair.client.inbound.pop_first().unwrap();
+
+    // RFC 9000 17.2.5.1: a client MUST discard a Retry whose Source Connection ID equals the
+    // Destination Connection ID of its Initial. Valid tag and token otherwise.
+    let mut echoing = valid_retry.clone();
+    let (_, _, token_at) = long_header_cids(&valid_retry.packet);
+    let token = valid_retry.packet[token_at..valid_retry.packet.len() - 16].to_vec();
+    echoing.packet = forge_retry(&valid_retry.packet, &orig_dst_cid, &token, orig_dst_cid);
+    echoing.remote = "[fd15:70a:510b:1::2]:12345".parse().unwrap();
+    let next_timeout = pair.client_conn_mut(client).poll_timeout();
+    pair.time += Duration::from_millis(1);
+    pair.client.inbound.push(pair.time, echoing);
+    pair.client.drive_incoming(pair.time);
+    for event in pair.client.conn_events.remove(&client).unwrap() {
+        pair.client_conn_mut(client).handle_event(event);
+    }
+    assert_eq!(
+        pair.client_conn_mut(client)
+            .network_path(crate::PathId::ZERO)
+            .unwrap(),
+        original,
+        "a Retry echoing the Initial's Destination CID must not migrate the handshake"
+    );
+    assert_eq!(pair.client_conn_mut(client).poll_timeout(), next_timeout);
+
+    pair.client.inbound.push(pair.time, valid_retry);
+    pair.drive();
+    let server = pair.server.assert_accept();
+    pair.finish_connect(client, server);
+}
+
 /// A Retry with `valid`'s first byte, version and destination CID, the given source CID
 /// and token, and an integrity tag that is valid for a client whose active remote CID is
 /// `orig_dst_cid`

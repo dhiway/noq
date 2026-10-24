@@ -121,6 +121,12 @@ fn version_negotiate_client() {
         .unwrap();
     let now = Instant::now();
     let mut buf = Vec::with_capacity(client.config().get_max_udp_payload_size() as usize);
+    client_ch
+        .poll_transmit(now, NonZeroUsize::MIN, &mut buf)
+        .expect("the client's first Initial");
+    // The server echoes the client's (empty) Source CID and its original Destination CID
+    let (orig_dst_cid, _, _) = long_header_cids(&buf);
+    buf.clear();
     let opt_event = client.handle(
         now,
         FourTuple {
@@ -129,11 +135,7 @@ fn version_negotiate_client() {
         },
         None,
         // Version negotiation packet for reserved version, with empty DCID
-        hex!(
-            "80 00000000 00 04 00000000
-             0a1a2a3a"
-        )[..]
-            .into(),
+        version_negotiation(&[], &orig_dst_cid, &[0x0a1a_2a3a]),
         &mut buf,
     );
     if let Some(DatagramEvent::ConnectionEvent(_, event)) = opt_event {
@@ -166,6 +168,69 @@ fn version_negotiation(dst_cid: &[u8], src_cid: &[u8], versions: &[u32]) -> Byte
 fn version_negotiation_reply(initial: &[u8], versions: &[u32]) -> BytesMut {
     let (dst_cid, src_cid, _) = long_header_cids(initial);
     version_negotiation(&src_cid, &dst_cid, versions)
+}
+
+/// Delivers `vn(initial)`, built from a client's first Initial, to that client before it has
+/// processed any packet, and asserts it was ignored: the connection does not end and the
+/// handshake completes
+fn fresh_client_ignores_version_negotiation(vn: impl FnOnce(&[u8]) -> BytesMut) {
+    let mut pair = Pair::default();
+    let client = pair.begin_connect(client_config());
+    pair.drive_client();
+    let (when, initial) = pair.server.inbound.pop_first().unwrap();
+    let mut forged = initial.clone();
+    forged.packet = vn(&initial.packet);
+    forged.remote = Pair::SERVER_ADDR;
+    forged.dst_ip = Some(Pair::CLIENT_ADDR.ip());
+    pair.server.inbound.push(when, initial);
+
+    pair.time += Duration::from_millis(1);
+    pair.client.inbound.push(pair.time, forged);
+    pair.client.drive_incoming(pair.time);
+    let events = pair.client.conn_events.remove(&client);
+    for event in events.expect("the packet must reach the connection") {
+        pair.client_conn_mut(client).handle_event(event);
+    }
+    assert_matches!(
+        pair.client_conn_mut(client).poll(),
+        None,
+        "an inadmissible Version Negotiation packet must not end the connection"
+    );
+
+    pair.drive();
+    let server = pair.server.assert_accept();
+    pair.finish_connect(client, server);
+}
+
+#[test]
+fn version_negotiation_with_empty_version_list_is_ignored() {
+    let _guard = subscribe();
+    // RFC 8999 6: a client MUST ignore a Version Negotiation packet that contains no
+    // Supported Version fields
+    fresh_client_ignores_version_negotiation(|initial| version_negotiation_reply(initial, &[]));
+}
+
+#[test]
+fn version_negotiation_with_truncated_version_list_is_ignored() {
+    let _guard = subscribe();
+    // RFC 8999 6: ... or contains a truncated Supported Version value
+    fresh_client_ignores_version_negotiation(|initial| {
+        let mut packet = version_negotiation_reply(initial, &[0x0a1a_2a3a]);
+        packet.put_u16(0x0a1a);
+        packet
+    });
+}
+
+#[test]
+fn version_negotiation_not_echoing_original_dst_cid_is_ignored() {
+    let _guard = subscribe();
+    // RFC 9000 17.2.1: the Source Connection ID of a Version Negotiation packet is the
+    // Destination Connection ID the client chose. One that does not echo it was not sent in
+    // reply to this client's Initial.
+    fresh_client_ignores_version_negotiation(|initial| {
+        let (_, client_cid, _) = long_header_cids(initial);
+        version_negotiation(&client_cid, &[0x42; 8], &[0x0a1a_2a3a])
+    });
 }
 
 #[test]
