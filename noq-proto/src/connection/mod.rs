@@ -4349,7 +4349,7 @@ impl Connection {
                     self.qlog.emit_packet_received(qlog, now);
                     return;
                 }
-                if matches!(packet.header, Header::Retry { .. }) {
+                if let Header::Retry { src_cid, .. } = packet.header {
                     let is_valid_retry = self
                         .remote_cids
                         .get(&path_id)
@@ -4364,6 +4364,7 @@ impl Connection {
                         .unwrap_or_default();
                     if self.total_authed_packets > 0
                     || packet.payload.len() <= 16 // token + 16 byte tag
+                    || src_cid == self.initial_dst_cid
                     || !is_valid_retry
                     {
                         trace!("discarding invalid Retry");
@@ -4372,6 +4373,9 @@ impl Connection {
                         //   receives.
                         // - A client MUST discard a Retry packet with a zero-length Retry Token
                         //   field.
+                        // - A client MUST discard a Retry packet that contains a Source Connection
+                        //   ID field that is identical to the Destination Connection ID field of
+                        //   its Initial packet.
                         // - Clients MUST discard Retry packets that have a Retry Integrity Tag that
                         //   cannot be validated
                         self.qlog.emit_packet_received(qlog, now);
@@ -4382,7 +4386,10 @@ impl Connection {
                 // Version Negotiation is not protected at all. Check whether it is still
                 // admissible before it can migrate the handshake path or affect
                 // authenticated-packet accounting and timers.
-                if matches!(packet.header, Header::VersionNegotiate { .. }) {
+                if let Header::VersionNegotiate {
+                    src_cid, dst_cid, ..
+                } = packet.header
+                {
                     let versions = &packet.payload;
                     let (whole, _) = versions.as_chunks::<4>();
                     let lists_our_version =
@@ -4391,6 +4398,8 @@ impl Connection {
                         || self.total_authed_packets > 0
                         || versions.is_empty()
                         || versions.len() % 4 != 0
+                        || src_cid != self.initial_dst_cid
+                        || dst_cid != self.handshake_cid
                         || lists_our_version
                     {
                         trace!("discarding inadmissible Version Negotiation");
@@ -4402,6 +4411,8 @@ impl Connection {
                         //   version selected by the client.
                         // - A packet whose version list is empty or not a whole number of versions
                         //   is malformed.
+                        // - A server's Version Negotiation echoes the client's Connection IDs; one
+                        //   that does not was not sent in reply to this client's Initial.
                         self.qlog.emit_packet_received(qlog, now);
                         return;
                     }
@@ -4665,8 +4676,14 @@ impl Connection {
             } => {
                 debug_assert_eq!(path_id, PathId::ZERO);
 
+                // handle_packet admits only a client's first Retry, which always finds the
+                // ClientHello still held. Should that ever change, discard rather than panic on
+                // a packet anyone can send.
+                let Some(client_hello) = state.client_hello.take() else {
+                    debug!("discarding Retry without a pending ClientHello");
+                    return Ok(());
+                };
                 trace!("retrying with CID {}", remote_cid);
-                let client_hello = state.client_hello.take().unwrap();
                 self.retry_src_cid = Some(remote_cid);
                 self.remote_cids
                     .get_mut(&path_id)
