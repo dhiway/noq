@@ -192,10 +192,9 @@ fn version_negotiation_listing_our_version_does_not_block_retry() {
     pair.time += Duration::from_millis(1);
     pair.client.inbound.push(pair.time, vn);
     pair.client.drive_incoming(pair.time);
-    if let Some(events) = pair.client.conn_events.remove(&client) {
-        for event in events {
-            pair.client_conn_mut(client).handle_event(event);
-        }
+    let events = pair.client.conn_events.remove(&client);
+    for event in events.expect("the packet must reach the connection") {
+        pair.client_conn_mut(client).handle_event(event);
     }
     assert_eq!(
         pair.client_conn_mut(client)
@@ -233,10 +232,9 @@ fn version_negotiation_from_another_address_does_not_migrate() {
     pair.time += Duration::from_millis(1);
     pair.client.inbound.push(pair.time, vn);
     pair.client.drive_incoming(pair.time);
-    if let Some(events) = pair.client.conn_events.remove(&client) {
-        for event in events {
-            pair.client_conn_mut(client).handle_event(event);
-        }
+    let events = pair.client.conn_events.remove(&client);
+    for event in events.expect("the packet must reach the connection") {
+        pair.client_conn_mut(client).handle_event(event);
     }
     assert_eq!(
         pair.client_conn_mut(client)
@@ -293,17 +291,15 @@ fn version_negotiation_after_handshake_does_not_reset_idle_timers() {
     };
     pair.client.inbound.push(pair.time, to_client);
     pair.client.drive_incoming(pair.time);
-    if let Some(events) = pair.client.conn_events.remove(&client) {
-        for event in events {
-            pair.client_conn_mut(client).handle_event(event);
-        }
+    let events = pair.client.conn_events.remove(&client);
+    for event in events.expect("the packet must reach the connection") {
+        pair.client_conn_mut(client).handle_event(event);
     }
     pair.server.inbound.push(pair.time, to_server);
     pair.server.drive_incoming(pair.time);
-    if let Some(events) = pair.server.conn_events.remove(&server) {
-        for event in events {
-            pair.server_conn_mut(server).handle_event(event);
-        }
+    let events = pair.server.conn_events.remove(&server);
+    for event in events.expect("the packet must reach the connection") {
+        pair.server_conn_mut(server).handle_event(event);
     }
     assert_eq!(
         pair.client_conn_mut(client)
