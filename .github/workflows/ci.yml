@@ -268,7 +268,7 @@ jobs:
     name: Android Emulator Tests
     if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
     timeout-minutes: 45
-    runs-on: [self-hosted, linux, X64]
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
