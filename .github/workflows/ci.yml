@@ -29,6 +29,13 @@ jobs:
     if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
     uses: "$/.github/workflows/tests.yaml"
 
+  min-crates:
+    name: Min Crates
+    uses: "n0-computer/workflows/.github/workflows/minimal-crates.yaml@v2"
+    with:
+      fips: true
+      crate-selection: "--workspace --exclude fuzz --all-features --lib --bins"
+
   test-aws-lc-rs:
     name: Test aws-lc-rs crypto backend
     if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
@@ -170,6 +177,10 @@ jobs:
         with:
           node-version: 20
       - uses: bytecodealliance/actions/wasm-tools/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1.1.3
+        with:
+          # Pinned: with `latest` the action pages through the list-releases API,
+          # which intermittently returns an empty array and fails the job.
+          version: "1.262.0"
       - uses: cargo-bins/cargo-binstall@8110b3aa84cb581a90696bc57469b0656f972494 # v1.16.3
 
       - name: wasm32 test build (noq-proto)
@@ -184,8 +195,13 @@ jobs:
       # If the Wasm file contains any 'import "env"' declarations, then
       # some non-Wasm-compatible code made it into the final code.
       - name: Ensure no 'import "env"' in noq-proto Wasm
+        shell: bash
         run: |
-          ! wasm-tools print --skeleton target/wasm32-unknown-unknown/debug/deps/noq_proto-*.wasm | grep 'import "env"'
+          wasm=$(cargo test --locked -p noq-proto --target wasm32-unknown-unknown --no-run --message-format=json \
+            | jq -r 'select(.executable != null and .target.kind == ["lib"]) | .executable')
+          test -f "$wasm"
+          skeleton=$(wasm-tools print --skeleton "$wasm")
+          ! grep 'import "env"' <<< "$skeleton"
       - name: Ensure no 'import "env"' in noq Wasm
         run: |
           ! wasm-tools print --skeleton target/wasm32-unknown-unknown/debug/noq.wasm | grep 'import "env"'
@@ -252,7 +268,7 @@ jobs:
     name: Android Emulator Tests
     if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
     timeout-minutes: 45
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, X64]
     strategy:
       fail-fast: false
       matrix:
@@ -301,7 +317,6 @@ jobs:
       - name: Build unit tests for Android
         env:
           RUSTC_WRAPPER: "sccache"
-          SCCACHE_GHA_ENABLED: "on"
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: cargo ndk -t ${{ matrix.target }} test --locked --no-run
 
@@ -313,6 +328,7 @@ jobs:
 
       - name: Set up Android Emulator and run tests
         env:
+          RUSTC_WRAPPER: "sccache"
           TARGET: ${{ matrix.target }}
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
