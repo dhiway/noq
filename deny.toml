@@ -4,6 +4,7 @@
 yanked = "deny"
 ignore = [
     "RUSTSEC-2025-0121", # gcc is only included as a minimal-versions workaround, not actually used
+    "RUSTSEC-2026-0542", # unmaintained: humantime, via iroh-dns-server, humantime-serde, n0-qlog
 ]
 
 [licenses]
