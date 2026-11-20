@@ -169,7 +169,7 @@ jobs:
   build_and_test_windows:
     timeout-minutes: 30
     name: "Tests"
-    runs-on: blacksmith-8vcpu-windows-2025
+    runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
